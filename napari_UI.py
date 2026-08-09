@@ -283,16 +283,71 @@ def _read_estimated_voxel_size(path):
         return (z, y, x)
 
 
-def _read_aics_voxel_size(path, reconstruct_mosaic=False):
+def _read_aics_voxel_size(path, reconstruct_mosaic=False, scene_index=0):
     voxel_size = (1.0, 1.0, 1.0)
     try:
         img = AICSImage(str(path), reconstruct_mosaic=reconstruct_mosaic)
+        scenes = tuple(getattr(img, "scenes", ()) or ())
+        if scenes and 0 <= int(scene_index) < len(scenes):
+            img.set_scene(int(scene_index))
         p = getattr(img, "physical_pixel_sizes", None)
         if p is not None and p.Z is not None and p.Y is not None and p.X is not None:
             voxel_size = (float(p.Z), float(p.Y), float(p.X))
     except Exception:
         pass
     return voxel_size
+
+
+def _lif_scene_choices(path):
+    """Return readable labels and metadata for every image stored in a LIF."""
+    lif = LifFile(str(path))
+    choices = []
+    for index, lif_image in enumerate(lif.get_iter_image()):
+        dims = lif_image.dims
+        x = int(getattr(dims, "x", 1) or 1)
+        y = int(getattr(dims, "y", 1) or 1)
+        z = int(getattr(dims, "z", 1) or 1)
+        mosaics = int(getattr(dims, "m", 1) or 1)
+        name = str(getattr(lif_image, "name", "") or f"Image {index + 1}")
+        tile_note = f", {mosaics} tiles" if mosaics > 1 else ""
+        label = f"{index + 1}: {name}  ({x} x {y} x {z}{tile_note})"
+        choices.append({
+            "index": index,
+            "label": label,
+            "name": name,
+            "x": x,
+            "y": y,
+            "z": z,
+            "mosaics": mosaics,
+        })
+    return choices
+
+
+def choose_lif_scene(path, parent=None):
+    """Ask which image/scene in a LIF to load; prefer the largest by default."""
+    choices = _lif_scene_choices(path)
+    if not choices:
+        raise ValueError("The selected LIF file contains no readable images.")
+    if len(choices) == 1:
+        return choices[0]["index"]
+
+    # Leica's stitched result is commonly the largest XY image in the file.
+    default = max(
+        range(len(choices)),
+        key=lambda i: choices[i]["x"] * choices[i]["y"],
+    )
+    labels = [choice["label"] for choice in choices]
+    selected, ok = QInputDialog.getItem(
+        parent,
+        "Choose LIF image",
+        "This LIF contains multiple images. Choose the tile scan or stitched image:",
+        labels,
+        default,
+        False,
+    )
+    if not ok:
+        return None
+    return choices[labels.index(selected)]["index"]
 
 
 def load_tiff_like_memmap(
@@ -591,7 +646,9 @@ def load_lif_memmap(path, scene_index=0, max_ch=4, out_dtype=None, flush_every=8
         out_dtype = src_dtype if np.dtype(src_dtype).itemsize <= 4 else np.float32
     out_dtype = np.dtype(out_dtype)
 
-    voxel_size = _read_aics_voxel_size(path, reconstruct_mosaic=False)
+    voxel_size = _read_aics_voxel_size(
+        path, reconstruct_mosaic=False, scene_index=scene_index
+    )
     memmaps, paths = _make_output_memmaps("lif", n_ch, num_z, y, x, out_dtype)
 
     print("Writing LIF frames to memory-mapped files...")
@@ -908,6 +965,12 @@ class MaskTunerDialog(QDialog):
         self.otsu_btn = QPushButton("Otsu (this slice)")
         ctrl.addWidget(self.otsu_btn)
 
+        self.otsu_stack_btn = QPushButton("Otsu (whole stack)")
+        self.otsu_stack_btn.setToolTip(
+            "Calculate one global Otsu threshold from all voxels in this channel"
+        )
+        ctrl.addWidget(self.otsu_stack_btn)
+
         ctrl.addWidget(QLabel("Threshold"))
         self.th_slider = QSlider(Qt.Horizontal)
         self._update_threshold_slider_range()
@@ -953,6 +1016,7 @@ class MaskTunerDialog(QDialog):
         self.sigma_slider.valueChanged.connect(self._on_sigma_changed)
 
         self.otsu_btn.clicked.connect(self._otsu_current_slice)
+        self.otsu_stack_btn.clicked.connect(self._otsu_whole_stack)
         self.accept_btn.clicked.connect(self._accept_mask)
 
         self.save_meta_btn.clicked.connect(self._save_channel_meta)
@@ -1274,6 +1338,35 @@ class MaskTunerDialog(QDialog):
 
         self.th_val.setText(str(int(self.threshold)))
         self._preview_current_slice()
+
+    def _otsu_whole_stack(self):
+        """Calculate one Otsu threshold from the complete 3D channel stack."""
+        self._refresh_source_from_parent()
+
+        self.otsu_stack_btn.setEnabled(False)
+        self.otsu_stack_btn.setText("Calculating...")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            try:
+                th = float(threshold_otsu(self.arr3))
+            except Exception:
+                th = float(np.mean(self.arr3))
+
+            self.threshold = int(th)
+            self.th_slider.blockSignals(True)
+            try:
+                self.th_slider.setValue(
+                    max(0, min(self.threshold, self.th_slider.maximum()))
+                )
+            finally:
+                self.th_slider.blockSignals(False)
+
+            self.th_val.setText(str(int(self.threshold)))
+            self._preview_current_slice()
+        finally:
+            QApplication.restoreOverrideCursor()
+            self.otsu_stack_btn.setText("Otsu (whole stack)")
+            self.otsu_stack_btn.setEnabled(True)
 
     # ---------------- mask preview ----------------
     def _preview_current_slice(self):
@@ -7972,9 +8065,15 @@ class UIWidget(QWidget):
             self.current_file_path = str(p)
             print(f"\n[load_channels] Loading: {p}")
 
+            scene_index = 0
+            if p.suffix.lower() == ".lif":
+                scene_index = choose_lif_scene(p, self)
+                if scene_index is None:
+                    return
+
             channel_mmaps, contrast_limits, voxel_size, temp_paths = load_image_memmap(
                 p,
-                scene_index=0,
+                scene_index=scene_index,
                 max_ch=4,
                 chunk_size=64,
                 out_dtype=None,
@@ -9646,10 +9745,17 @@ def main():
     print(f"Loading: {file_path}")
 
     try:
+        scene_index = 0
+        if file_path.suffix.lower() == ".lif":
+            scene_index = choose_lif_scene(file_path)
+            if scene_index is None:
+                print("LIF image selection cancelled.")
+                return
+
         # Load (memmap)
         channel_mmaps, contrast_limits, voxel_size, temp_paths = load_image_memmap(
         file_path,
-        scene_index=0,
+        scene_index=scene_index,
         max_ch=4,
         chunk_size=64,
         out_dtype=None,
